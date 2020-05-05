@@ -15,8 +15,15 @@ from __future__ import absolute_import, division, print_function
 import json
 import os
 import librosa
+import pickle
 import numpy as np
+import random
 from random import shuffle
+from keras import backend as K
+from keras.layers import (Input, Lambda)
+from keras.models import Model
+from keras.optimizers import SGD
+from keras.callbacks import ModelCheckpoint
 
 
 def create_transcript_from_folder(data_directory, group, speaker, output_file):
@@ -148,7 +155,7 @@ def get_mfcc(audio_path, n_mfcc=13):
 
 def fit_train(train_path, train_duration, train_text, k_samples=100, seed=123):
     rng = random.Random(seed)
-    k_samples = min(k_samples, len(self.train_audio_paths))
+    k_samples = min(k_samples, len(train_path))
     samples = rng.sample(train_path, k_samples)
     feats = [get_mfcc(s) for s in samples]
     feats = np.vstack(feats)
@@ -157,9 +164,137 @@ def fit_train(train_path, train_duration, train_text, k_samples=100, seed=123):
     
     return feats, feats_mean, feats_std
     
+    
 def normalize(mfcc_feature, feats_mean, feats_std, eps=1e-14):
-    return (feature - feats_mean) / (feats_std + eps)
+    return (mfcc_feature - feats_mean) / (feats_std + eps)
 
-def train_model():
+
+def ctc_lambda_func(args):
+    y_pred, labels, input_length, label_length = args
+    return K.ctc_batch_cost(labels, y_pred, input_length, label_length)
+
+
+def add_ctc_loss(input_model):
+    the_labels = Input(name='the_labels', shape=(None,), dtype='float32')
+    input_lengths = Input(name='input_length', shape=(1,), dtype='int64')
+    label_lengths = Input(name='label_length', shape=(1,), dtype='int64')
+    output_lengths = Lambda(input_model.output_length)(input_lengths)
+    
+    # CTC loss is implemented in a lambda layer
+    loss_out = Lambda(ctc_lambda_func, output_shape=(1,), name='ctc')(
+        [input_model.output, the_labels, output_lengths, label_lengths])
+    
+    model = Model(
+        inputs=[input_model.input, the_labels, input_lengths, label_lengths], 
+        outputs=loss_out)
+    
+    return model
+
+
+def text_to_int_map(text_sequence):
+    character_map = {'\'':0, '<SPACE>': 1, 'a':2, 'b':3, 'c':4, 'd':5, 'e':6, 'f':7, 'g':8, 'h':9, 'i':10, 
+                    'j':11, 'k':12, 'l':13, 'm':14, 'n':15, 'o':16, 'p':17, 'q':18, 'r':19, 's':20, 't':21,
+                    'u':22, 'v':23, 'w':24, 'x':25, 'y':26, 'z':27}
+    output_sequence = []
+    for letter in text_sequence:
+        if letter == ' ':
+            output_sequence.append(character_map['<SPACE>'])
+        else:
+            output_sequence.append(character_map[letter])
+    
+    return output_sequence
+
+
+def get_batch(path, text, feats_mean, feats_std, current_index=0, minibatch_size=20, mfcc_dim=13):
     # TODO: Implement
-    pass
+    features = [normalize(get_mfcc(a), feats_mean, feats_std) for a in path[current_index:current_index+minibatch_size]]
+    
+    # calculate necessary sizes
+    max_length = max([features[i].shape[0] for i in range(0, minibatch_size)])
+    max_string_length = max([len(text[current_index+i]) for i in range(0, minibatch_size)])
+    
+    X_data = np.zeros([minibatch_size, max_length, mfcc_dim])
+    labels = np.ones([minibatch_size, max_string_length]) * 28
+    input_length = np.zeros([minibatch_size, 1])
+    label_length= np.zeros([minibatch_size, 1])
+    
+    for i in range(minibatch_size):
+        feat = features[i]
+        input_length[i] = feat.shape[0]
+        X_data[i, :feat.shape[0], :] = feat
+    
+        # calculate labels & label_length
+        label = np.array(text_to_int_map(text[current_index+i])) 
+        labels[i, :len(label)] = label
+        label_length[i] = len(label)
+    
+    
+    # return the arrays
+    outputs = {'ctc': np.zeros([minibatch_size])}
+    inputs = {'the_input': X_data, 
+             'the_labels': labels, 
+             'input_length': input_length, 
+             'label_length': label_length }
+    return (inputs, outputs)
+
+
+def next_batch(path, duration, text, feats_mean, feats_std, current_index=0, minibatch_size=20):
+    current_index = current_index
+    while True:
+        ret = get_batch(path, text, feats_mean, feats_std, current_index=current_index, minibatch_size=20)
+        current_index += minibatch_size
+        if current_index >= len(text) - minibatch_size:
+            current_index = 0
+            # shuffle(path, duration, text)
+        yield ret
+
+
+def train_model(input_model, 
+                pickle_path,
+                save_model_path,
+                train_path,
+                train_duration,
+                train_text,
+                validation_path,
+                validation_duration,
+                validation_text,
+                feats_mean,
+                feats_std,
+                minibatch_size=20,
+                mfcc_dim=13,
+                optimizer=SGD(lr=0.02, decay=1e-6, momentum=0.9, nesterov=True, clipnorm=5),
+                epochs=20,
+                verbose=1):
+    # Calculating steps per epoch:
+    stepPerEpoch = len(train_path)//minibatch_size
+    print('Epoch step: {}'.format(stepPerEpoch))
+    
+    # Calculating validation steps
+    stepPerVal = len(validation_path)//minibatch_size
+    print('Validation step: {}'.format(stepPerVal))
+    
+    # add CTC loss to the NN specified in input_to_softmax
+    model = add_ctc_loss(input_model)
+    
+    # CTC loss is implemented elsewhere, so use a dummy lambda function for the loss
+    model.compile(loss={'ctc': lambda y_true, y_pred: y_pred}, optimizer=optimizer)
+
+    # make results/ directory, if necessary
+    if not os.path.exists('results'):
+        os.makedirs('results')
+
+    # add checkpointer
+    checkpointer = ModelCheckpoint(filepath='results/'+save_model_path, verbose=0)
+    
+    # TODO: Implement: Still needs fixing (next_train, next_balid)
+    # train the model
+    hist = model.fit_generator(generator=next_batch(train_path, train_duration, train_text, feats_mean=feats_mean, feats_std=feats_std), 
+                               steps_per_epoch=stepPerEpoch,
+                               epochs=epochs, 
+                               validation_data=next_batch(validation_path, validation_duration, validation_text, feats_mean=feats_mean, feats_std=feats_std), 
+                               validation_steps=stepPerVal,
+                               callbacks=[checkpointer], verbose=verbose)
+
+    # save model loss
+    with open('results/'+pickle_path, 'wb') as f:
+        pickle.dump(hist.history, f)
