@@ -18,7 +18,9 @@ import librosa
 import pickle
 import numpy as np
 import random
+from pprint import pprint
 from random import shuffle
+from IPython.display import Audio
 from keras import backend as K
 from keras.layers import (Input, Lambda)
 from keras.models import Model
@@ -79,6 +81,34 @@ def create_transcript(data_directory, groups, output_file):
                     out_file.write(line + '\n')
     print('Done creating {}'.format(output_file))
 
+    
+def create(data_directory, output_file):
+    labels = []
+    durations = []
+    keys = []
+    for group in os.listdir(data_directory):
+        speaker_path = os.path.join(data_directory, group)
+        for speaker in os.listdir(speaker_path):
+            labels_file = os.path.join(speaker_path, speaker,
+                                       '{}-{}.trans.txt'
+                                       .format(group, speaker))
+            for line in open(labels_file):
+                split = line.strip().split()
+                file_id = split[0]
+                label = ' '.join(split[1:]).lower()
+                audio_file = os.path.join(speaker_path, speaker,
+                                          file_id) + '.flac'
+                timeSeries, samplingRate = librosa.load(audio_file)
+                duration = librosa.get_duration(timeSeries, samplingRate)
+                keys.append(audio_file)
+                durations.append(duration)
+                labels.append(label)
+    with open(output_file, 'w') as out_file:
+        for i in range(len(keys)):
+            line = json.dumps({'key': keys[i], 'duration': durations[i],
+                              'text': labels[i]})
+            out_file.write(line + '\n')
+
 
 def train_test_val_split(desc_file):
     """ 
@@ -105,12 +135,16 @@ def train_test_val_split(desc_file):
             data.append(line)
         shuffle(data)
         
-        train_num = int(len(data) * 0.75)
-        val_num = train_num + int(len(data)*0.15)
+        train_num = int(len(data) * 0.8)
+        # train_num = int(len(data) * 0.75)
+        # val_num = train_num + int(len(data)*0.15)
+        
+        # train_set = data[:train_num]
+        # test_set = data[val_num:]
+        # validation_set = data[train_num:val_num]
         
         train_set = data[:train_num]
-        test_set = data[val_num:]
-        validation_set = data[train_num:val_num]
+        validation_set = data[train_num:]
         
         for i, each in enumerate(train_set):
             spec = json.loads(each)
@@ -120,13 +154,13 @@ def train_test_val_split(desc_file):
             if i == len(train_set) - 2:
                 break
         
-        for i, each in enumerate(test_set):
-            spec = json.loads(each)
-            test_path.append(spec['key'])
-            test_duration.append(float(spec['duration']))
-            test_text.append(spec['text'])
-            if i == len(train_set) - 2:
-                break
+        # for i, each in enumerate(test_set):
+        #    spec = json.loads(each)
+        #    test_path.append(spec['key'])
+        #    test_duration.append(float(spec['duration']))
+        #    test_text.append(spec['text'])
+        #    if i == len(train_set) - 2:
+        #        break
         
         for i, each in enumerate(validation_set):
             spec = json.loads(each)
@@ -136,7 +170,8 @@ def train_test_val_split(desc_file):
             if i == len(train_set) - 2:
                 break
             
-    return train_path, train_duration, train_text, test_path, test_duration, test_text, validation_path, validation_duration, validation_text
+    # return train_path, train_duration, train_text, test_path, test_duration, test_text, validation_path, validation_duration, validation_text
+    return train_path, train_duration, train_text, validation_path, validation_duration, validation_text
         
 def sort_data(input_path, input_duration, input_text):
     index = np.argsort(input_duration).tolist()
@@ -204,6 +239,17 @@ def text_to_int_map(text_sequence):
     
     return output_sequence
 
+def int_sequence_to_text(int_sequence):
+    """ Convert an integer sequence to text """
+    int_map = {1: "'", 2: ' ', 3: 'a', 4: 'b', 5: 'c', 6: 'd', 7: 'e', 8: 'f', 9: 'g', 10: 'h',
+               11: 'i', 12: 'j', 13: 'k', 14: 'l', 15: 'm', 16: 'n', 17: 'o', 18: 'p', 19: 'q', 
+               20: 'r', 21: 's', 22: 't', 23: 'u', 24: 'v', 25: 'w', 26: 'x', 27: 'y', 28: 'z'}
+    text = []
+    for c in int_sequence:
+        ch = int_map[c]
+        text.append(ch)
+    return text
+
 
 def get_batch(path, text, feats_mean, feats_std, current_index=0, minibatch_size=20, mfcc_dim=13):
     # TODO: Implement
@@ -240,12 +286,15 @@ def get_batch(path, text, feats_mean, feats_std, current_index=0, minibatch_size
 
 def next_batch(path, duration, text, feats_mean, feats_std, current_index=0, minibatch_size=20):
     current_index = current_index
+    random.seed(123)
     while True:
         ret = get_batch(path, text, feats_mean, feats_std, current_index=current_index, minibatch_size=20)
         current_index += minibatch_size
         if current_index >= len(text) - minibatch_size:
             current_index = 0
-            # shuffle(path, duration, text)
+            random.Random(123).shuffle(path)
+            random.Random(123).shuffle(duration)
+            random.Random(123).shuffle(text)
         yield ret
 
 
@@ -286,7 +335,6 @@ def train_model(input_model,
     # add checkpointer
     checkpointer = ModelCheckpoint(filepath='results/'+save_model_path, verbose=0)
     
-    # TODO: Implement: Still needs fixing (next_train, next_balid)
     # train the model
     hist = model.fit_generator(generator=next_batch(train_path, train_duration, train_text, feats_mean=feats_mean, feats_std=feats_std), 
                                steps_per_epoch=stepPerEpoch,
@@ -298,3 +346,23 @@ def train_model(input_model,
     # save model loss
     with open('results/'+pickle_path, 'wb') as f:
         pickle.dump(hist.history, f)
+
+
+def get_predictions(index, path, text, input_model, model_path, feats_mean, feats_std):
+    transcription = text[index]
+    audio_path = path[index]
+    data_point = normalize(get_mfcc(audio_path), feats_mean, feats_std)
+
+    input_model.load_weights(model_path)
+    prediction = input_model.predict(np.expand_dims(data_point, axis=0))
+    output_length = [input_model.output_length(data_point.shape[0])]
+    print(data_point.shape)
+    pred_ints = (K.eval(K.ctc_decode(prediction, output_length)[0][0])+1).flatten().tolist()
+
+    print('-'*80)
+    Audio(audio_path)
+    print('True transcription:\n' + '\n' + transcription)
+    print('-'*80)
+    print('Predicted transcription:\n' + '\n' + ''.join(int_sequence_to_text(pred_ints)))
+    print('-'*80)
+    
